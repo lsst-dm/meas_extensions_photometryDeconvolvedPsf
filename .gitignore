@@ -1,0 +1,17 @@
+*.dylib
+*.o
+*.os
+*.pyc
+*.so
+.sconf_temp
+.sconsign.dblite
+config.log
+.sconsign.dblite
+config.log
+.sconf_temp
+doc/htmlDir
+python/lsst/meas/extensions/photometryDeconvolvedPsf/deconvolvedPsfLib.py
+python/lsst/meas/extensions/photometryDeconvolvedPsf/deconvolvedPsfLib_wrap*
+tests/.tests
+ups/*.cfgc
+python/lsst/meas/extensions/photometryDeconvolvedPsf/version.py
