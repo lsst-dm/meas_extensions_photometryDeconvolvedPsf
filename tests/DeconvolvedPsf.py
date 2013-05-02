@@ -41,7 +41,6 @@ class DeconvolvedPsfPhotometryTestCase(unittest.TestCase):
     """A test case for measuring DeconvolvedPsf quantities"""
 
     def setUp(self):
-        self.flux = 1e5
         self.width, self.height = 70, 70
         self.objImg = None
         
@@ -49,15 +48,25 @@ class DeconvolvedPsfPhotometryTestCase(unittest.TestCase):
         if self.objImg:
             del self.objImg
 
-    def makeAndMeasure(self, alpha, b, dx=0.0, dy=0.0):
-        """Make and measure a Gaussian"""
+    def makePsf(self, alpha, b, flux0=0):
+        ksize = 25                      # size of desired kernel
+
+        flux0_min = 1e3                 # minimum flux to modify PSF width
+        c = 0.1
+        if flux0 > flux0_min:
+            alpha = math.hypot(alpha, c*math.log10(flux0/flux0_min))
+
+            print alpha, c*math.log10(flux0/flux0_min)
+        return measAlg.DoubleGaussianPsf(ksize, ksize, alpha, 2*alpha, b)
+
+    def makeAndMeasure(self, flux0, alpha, b, dx=0.0, dy=0.0):
+        """Make and measure a PSF"""
 
         xcen, ycen = 0.5*self.width + 11 + dx, 0.5*self.height + 12 + dy
         #
         # Create the PSF
         #
-        ksize = 25                      # size of desired kernel
-        psf = measAlg.DoubleGaussianPsf(ksize, ksize, alpha, 2*alpha, b)
+        psf = self.makePsf(alpha, b)
         #
         # Make the object
         #
@@ -66,8 +75,8 @@ class DeconvolvedPsfPhotometryTestCase(unittest.TestCase):
             gal = afwImage.ImageF(self.width, self.height)
             gal.setXY0(10, 10)
 
-            obj = psf.computeImage(afwGeom.PointD(xcen, ycen))
-            obj *= self.flux/obj.getArray().sum()
+            obj = self.makePsf(alpha, b, flux0).computeImage(afwGeom.PointD(xcen, ycen))
+            obj *= flux0/obj.getArray().sum()
 
             if False:               # requires support for gal[obj.getBBox(), afwImage.PARENT]
                 gal[obj.getBBox(afwImage.PARENT), afwImage.PARENT] = obj.convertF()
@@ -130,14 +139,15 @@ class DeconvolvedPsfPhotometryTestCase(unittest.TestCase):
         for dx in (0.0, 0.5,):
             for dy in (0.0, 0.5,):
                 for alpha, b in ab_vals:
-                    flux, fluxErr, flags = self.makeAndMeasure(alpha, b, dx=dx, dy=dy)
-
-                    failFlux =  math.isnan(flux) or flags or abs(flux/self.flux - 1) > 1e-6
-
-                    ID = "alpha,b %4.1f, %5.2f  dx,dy = %.1f,%.1f " % (alpha, b, dx, dy)
-                    self.assertFalse(failFlux, (("%s  flux_DeconvolvedPsf: %g v. exact value %g " +
-                                                 "(error %.2f%%)") %
-                                                (ID, flux, self.flux, 100*(flux/self.flux - 1))))
+                    for flux0 in (1e3, 1e5,):
+                        flux, fluxErr, flags = self.makeAndMeasure(flux0, alpha, b, dx=dx, dy=dy)
+                        
+                        failFlux =  math.isnan(flux) or flags or abs(flux/flux0 - 1) > 1e-6
+                        
+                        ID = "alpha,b %4.1f, %5.2f  dx,dy = %.1f,%.1f " % (alpha, b, dx, dy)
+                        self.assertFalse(failFlux, (("%s  flux_DeconvolvedPsf: %g v. exact value %g " +
+                                                     "(error %.2f%%)") %
+                                                    (ID, flux, flux0, 100*(flux/flux0 - 1))))
 
 #-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
