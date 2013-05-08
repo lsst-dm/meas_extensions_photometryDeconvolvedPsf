@@ -35,6 +35,19 @@ pexLogging.Trace_setVerbosity("meas.photometry.deconvolvedPsf", verbose)
 import lsst.afw.display.ds9 as ds9
 import lsst.afw.display.utils as displayUtils
 
+def calcRms(img):
+    xcen = img.getWidth()//2
+    ycen = img.getHeight()//2
+
+    sumrr = 0
+    for y in range(img.getHeight()):
+        for x in range(img.getWidth()):
+            sumrr += float(img[x, y])*((x - xcen)**2 + (y - ycen)**2)
+    sumrr /= img.getArray().sum()
+
+    return math.sqrt(sumrr/2)
+
+
 #-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 
 class DeconvolvedPsfPhotometryTestCase(unittest.TestCase):
@@ -43,30 +56,38 @@ class DeconvolvedPsfPhotometryTestCase(unittest.TestCase):
     def setUp(self):
         self.width, self.height = 70, 70
         self.objImg = None
+
+        self.psfFlux = 1e5              # Flux corresponding to the PSF
+        self.flux0 = 1e3                # Characteristic flux (see coeff)
+        self.coeff = 0.1                # Smooth with N(0, self.coeff*log10(flux/flux0)^2)
         
     def tearDown(self):
         if self.objImg:
             del self.objImg
 
-    def makePsf(self, alpha, b, flux0=0):
+    def makePsf(self, alpha, b, objFlux):
         ksize = 25                      # size of desired kernel
 
-        flux0_min = 1e3                 # minimum flux to modify PSF width
-        c = 0.1
-        if flux0 > flux0_min:
-            alpha = math.hypot(alpha, c*math.log10(flux0/flux0_min))
+        epsilon = self.coeff*math.log10(objFlux/self.flux0) if self.flux0 != 0.0 else 0.0
+        psf = measAlg.DoubleGaussianPsf(ksize, ksize,
+                                        math.hypot(alpha,   epsilon),
+                                        math.hypot(2*alpha, epsilon), b)
 
-            print alpha, c*math.log10(flux0/flux0_min)
-        return measAlg.DoubleGaussianPsf(ksize, ksize, alpha, 2*alpha, b)
+        if False:
+            kim = afwImage.ImageD(ksize, ksize)
+            kim = psf.computeImage()
+            print "alpha =", alpha, "eps =", epsilon, "rms =", calcRms(kim)
 
-    def makeAndMeasure(self, flux0, alpha, b, dx=0.0, dy=0.0):
+        return psf
+
+    def makeAndMeasure(self, objFlux, alpha, b, dx=0.0, dy=0.0):
         """Make and measure a PSF"""
 
         xcen, ycen = 0.5*self.width + 11 + dx, 0.5*self.height + 12 + dy
         #
         # Create the PSF
         #
-        psf = self.makePsf(alpha, b)
+        psf = self.makePsf(alpha, b, self.psfFlux)
         #
         # Make the object
         #
@@ -75,8 +96,8 @@ class DeconvolvedPsfPhotometryTestCase(unittest.TestCase):
             gal = afwImage.ImageF(self.width, self.height)
             gal.setXY0(10, 10)
 
-            obj = self.makePsf(alpha, b, flux0).computeImage(afwGeom.PointD(xcen, ycen))
-            obj *= flux0/obj.getArray().sum()
+            obj = self.makePsf(alpha, b, objFlux).computeImage(afwGeom.PointD(xcen, ycen))
+            obj *= objFlux/obj.getArray().sum()
 
             if False:               # requires support for gal[obj.getBBox(), afwImage.PARENT]
                 gal[obj.getBBox(afwImage.PARENT), afwImage.PARENT] = obj.convertF()
@@ -98,10 +119,22 @@ class DeconvolvedPsfPhotometryTestCase(unittest.TestCase):
         # Do the measuring
         #
         msConfig = measAlg.SourceMeasurementConfig()
+        msConfig.algorithms.names.add("flux.sinc")
+        msConfig.algorithms.names.add("flux.psf")
         msConfig.algorithms.names.add("flux.deconvolvedPsf")
         msConfig.algorithms.names.remove("correctfluxes")
+        msConfig.slots.apFlux = "flux.sinc"
+
+        msConfig.algorithms["flux.deconvolvedPsf"].priority = 4 # i.e. run after other flux algorithms
+        #msConfig.algorithms["flux.deconvolvedPsf"].deconvolutionKernelSigma = 0.4
+        msConfig.algorithms["flux.deconvolvedPsf"].coeff = self.coeff
+        msConfig.algorithms["flux.deconvolvedPsf"].psfFlux = self.psfFlux
+        msConfig.algorithms["flux.deconvolvedPsf"].flux0 = self.flux0
+        #msConfig.algorithms["flux.deconvolvedPsf"].niter = 15
+        #msConfig.algorithms["flux.deconvolvedPsf"].rmsTol = 1e-4
+        
         schema = afwTable.SourceTable.makeMinimalSchema()
-        ms = msConfig.makeMeasureSources(schema)
+        ms = msConfig.makeMeasureSources(schema) # add our fields
         
         table = afwTable.SourceTable.make(schema)
         msConfig.slots.setupTable(table)
@@ -119,7 +152,7 @@ class DeconvolvedPsfPhotometryTestCase(unittest.TestCase):
         flux = source.get("flux.deconvolvedPsf")
         fluxErr = source.get("flux.deconvolvedPsf.err")
         flags = source.get("flux.deconvolvedPsf.flags")
-        
+
         if display:
             xc, yc = xcen - self.objImg.getX0(), ycen - self.objImg.getY0()
             ds9.dot("x", xc, yc, ctype=ds9.MAGENTA, size=1, frame=ds9Frame)
@@ -127,7 +160,7 @@ class DeconvolvedPsfPhotometryTestCase(unittest.TestCase):
 
             shape = source.getShape()
 
-        return flux, fluxErr, flags
+        return flux, fluxErr, flags, source.get("flux.psf")
 
     def testEllipticalGaussian(self):
         """Test measuring the DeconvolvedPsf quantities of an elliptical Gaussian"""
@@ -139,15 +172,20 @@ class DeconvolvedPsfPhotometryTestCase(unittest.TestCase):
         for dx in (0.0, 0.5,):
             for dy in (0.0, 0.5,):
                 for alpha, b in ab_vals:
-                    for flux0 in (1e3, 1e5,):
-                        flux, fluxErr, flags = self.makeAndMeasure(flux0, alpha, b, dx=dx, dy=dy)
+                    for objFlux in (1e2, 1e3, 1e4, 1e5, 1e6, ):
+                        flux, fluxErr, flags, psfFlux = self.makeAndMeasure(objFlux, alpha, b, dx=dx, dy=dy)
                         
-                        failFlux =  math.isnan(flux) or flags or abs(flux/flux0 - 1) > 1e-6
+                        failFlux =  math.isnan(flux) or flags or abs(flux/objFlux - 1) > 2.5e-3
                         
                         ID = "alpha,b %4.1f, %5.2f  dx,dy = %.1f,%.1f " % (alpha, b, dx, dy)
-                        self.assertFalse(failFlux, (("%s  flux_DeconvolvedPsf: %g v. exact value %g " +
-                                                     "(error %.2f%%)") %
-                                                    (ID, flux, flux0, 100*(flux/flux0 - 1))))
+                        msg = "%s  flux_DeconvolvedPsf: %9.4g v. exact value %9.4g (error %5.2f%%) (psfFlux error %5.2f%%)" % \
+                            (ID, flux, objFlux, 100*(flux/objFlux - 1), 100*(psfFlux/objFlux - 1))
+
+                        if False:
+                            print msg
+                            #continue
+
+                        self.assertFalse(failFlux, msg)
 
 #-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 

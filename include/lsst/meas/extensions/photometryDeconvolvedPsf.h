@@ -14,33 +14,22 @@ namespace lsst { namespace meas { namespace extensions { namespace photometryDec
 class DeconvolvedPsfFluxControl : public algorithms::FluxControl {
 public:
 
-    LSST_CONTROL_FIELD(fixed, bool,
-                       "if true, use existing shape and centroid measurements instead of fitting");
-    LSST_CONTROL_FIELD(nSigmaForRadius, double,
-                       "Multiplier of rms size for aperture used to initially estimate the DeconvolvedPsf radius");
-    LSST_CONTROL_FIELD(nIterForRadius, int, "Number of times to iterate when setting the DeconvolvedPsf radius");
-    LSST_CONTROL_FIELD(nRadiusForFlux, double, "Number of DeconvolvedPsf radii for DeconvolvedPsf flux");
-    LSST_CONTROL_FIELD(maxSincRadius, double,
-                       "Largest aperture for which to use the slow, accurate, sinc aperture code");
-    LSST_CONTROL_FIELD(minimumRadius, double,
-                       "Minimum DeconvolvedPsf radius (if == 0.0 use PSF's DeconvolvedPsf radius). "
-                       "Ignored if enforceMinimumRadius is false");
-    LSST_CONTROL_FIELD(enforceMinimumRadius, bool, "If true check that the DeconvolvedPsf radius exceeds some minimum");
-    LSST_CONTROL_FIELD(useFootprintRadius, bool,
-                       "Use the Footprint size as part of initial estimate of DeconvolvedPsf radius");
-    LSST_CONTROL_FIELD(smoothingSigma, double,
-                       "Smooth image with N(0, smoothingSigma^2) Gaussian while estimating R_K");
+    LSST_CONTROL_FIELD(deconvolutionKernelSigma, double,
+                       "Convolve with an N(0, deconvolutionKernelSigma^2) Gaussian to estimate kernel");
+    LSST_CONTROL_FIELD(psfFlux, double, "Flux of the objects used to determine the PSF");
+    LSST_CONTROL_FIELD(flux0, double, "Reference flux (see coeff)");
+    LSST_CONTROL_FIELD(coeff, double, "Intensity smoothing is N(0, coeff*log10(apFlux/flux0))");
+    LSST_CONTROL_FIELD(niter, int, "Maximum number of iterations");
+    LSST_CONTROL_FIELD(rmsTol, double, "Tolerance in width when iterating");
 
     DeconvolvedPsfFluxControl() : 
-        algorithms::FluxControl("flux.deconvolvedPsf"), fixed(false),
-        nSigmaForRadius(6.0),
-        nIterForRadius(1),
-        nRadiusForFlux(2.5),
-        maxSincRadius(10.0),
-        minimumRadius(0.0),
-        enforceMinimumRadius(true),
-        useFootprintRadius(false),
-        smoothingSigma(-1.0)
+        algorithms::FluxControl("flux.deconvolvedPsf"),
+        deconvolutionKernelSigma(0.4),
+        psfFlux(1e5),
+        flux0(1e3),
+        coeff(0.0),
+        niter(15),
+        rmsTol(1e-4)
     {}
 
 private:

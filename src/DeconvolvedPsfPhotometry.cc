@@ -6,6 +6,8 @@
 #include "lsst/pex/logging/Trace.h"
 #include "lsst/afw/geom/Point.h"
 #include "lsst/afw/image.h"
+#include "lsst/afw/math/ConvolveImage.h"
+#include "lsst/afw/math/FunctionLibrary.h"
 #include "lsst/afw/math/Integrate.h"
 #include "lsst/meas/algorithms/Measure.h"
 
@@ -98,10 +100,10 @@ public:
 
         if (bbox.getDimensions() != _wimage->getDimensions()) {
             throw LSST_EXCEPT(pexExceptions::LengthErrorException,
-                              (boost::format("Footprint at %d,%d -- %d,%d is wrong size "
-                                             "for %d x %d weight image") %
-                               bbox.getMinX() % bbox.getMinY() % bbox.getMaxX() % bbox.getMaxY() %
-                               _wimage->getWidth() % _wimage->getHeight()).str());
+                              str(boost::format("Footprint at %d,%d -- %d,%d is wrong size "
+                                                "for %d x %d weight image") %
+                                  bbox.getMinX() % bbox.getMinY() % bbox.getMaxX() % bbox.getMaxY() %
+                                  _wimage->getWidth() % _wimage->getHeight()));
         }
     }
     
@@ -164,6 +166,31 @@ std::pair<double,double> computeDeconvolvedPsfFlux(
 }
 
 /************************************************************************************************************/
+
+template<typename ImageT>
+double
+calcRms(ImageT const& img)
+{
+    const int width = img.getWidth();
+    const int height = img.getHeight();
+
+    double const xcen = width/2;
+    double const ycen = height/2;
+
+    double sum = 0, sumrr = 0;
+    for (int y = 0; y != height; ++y) {
+        for (int x = 0; x != width; ++x) {
+            double const val = img(x, y);
+            sum += val;
+            sumrr += val*(pow(x - xcen, 2) + pow(y - ycen, 2));
+        }
+    }
+    sumrr /= sum;
+
+    return ::sqrt(sumrr/2);
+}
+
+/************************************************************************************************************/
 /**
  * Calculate the desired psf flux
  */
@@ -173,6 +200,9 @@ void DeconvolvedPsfFlux::_apply(
     afw::image::Exposure<PixelT> const& exposure,
     afw::geom::Point2D const & center
 ) const {
+    DeconvolvedPsfFluxControl const & ctrl =
+        static_cast<DeconvolvedPsfFluxControl const &>(this->getControl());
+
     source.set(getKeys().flag, true); // say we've failed so that's the result if we throw
     source.set(_fluxCorrectionKeys.psfFactorFlag, true);
     
@@ -185,11 +215,115 @@ void DeconvolvedPsfFlux::_apply(
     try {
         psfImage = psf->computeImage(center);
     } catch (lsst::pex::exceptions::Exception & e) {
-        LSST_EXCEPT_ADD(e, (boost::format("Computing PSF at (%.3f, %.3f)")
-                            % center.getX() % center.getY()).str());
+        LSST_EXCEPT_ADD(e, str(boost::format("Computing PSF at (%.3f, %.3f)")
+                               % center.getX() % center.getY()));
         throw e;
     }
+    //
+    // Allow for the variation of the PSF with intensity
+    //
+    if (source.getApFluxFlag()) {
+        throw LSST_EXCEPT(lsst::pex::exceptions::NotFoundException,
+                          str(boost::format("Aperture flux is invalid for object at (%.3f, %.3f)")
+                              % center.getX() % center.getY()));
+    }
 
+    double const apFlux = source.getApFlux(); // object's flux
+    double const flux0 = ctrl.flux0;          // fiducial flux (see coeff)
+    double const coeff = ctrl.coeff;    // intensity kernel is N(0, coeff*log10(flux/ctrl.flux0)^2)
+    double const psfFlux = ctrl.psfFlux;      // characteristic flux of the PSF
+    double const epsilon2 =
+        ::pow(coeff*::log10( apFlux/flux0), 2) - 
+        ::pow(coeff*::log10(psfFlux/flux0), 2); // (correction we need to apply)^2
+ 
+    double const psfRms = calcRms(*psfImage);
+
+    afwDetection::Psf::Image smoothed(psfImage->getDimensions());
+    bool const normalize = true;
+    bool const copyEdge = true;
+    if (epsilon2 > 0) {                  // we need to smooth our PSF model to match the object
+        double const psfRmsCorrected = ::sqrt(psfRms*psfRms + epsilon2);
+        //
+        // Iterate until we get the desired PSF width
+        //
+        double a = ::sqrt(epsilon2);    // width of needed smoothing kernel
+        for (int i = 0; i < ctrl.niter; ++i) {
+            a = ::hypot(a, 0.25);       // Undersampled kernels are essentially delta-functions
+            afwMath::GaussianFunction1<double> gauss(a);
+            int const kSize = 2*static_cast<int>(3*a + 1) + 1;
+            afwMath::SeparableKernel const kernel(kSize, kSize, gauss, gauss);
+
+            afwMath::convolve(smoothed, *psfImage, kernel, normalize, copyEdge);
+            double const rms = calcRms(smoothed);
+            if (rms >= psfRmsCorrected) {
+                break;
+            }
+
+            *psfImage = smoothed;
+
+            a = ::sqrt(::pow(psfRmsCorrected, 2) - ::pow(rms, 2));
+            
+            if (::fabs(a) < ctrl.rmsTol) { // good enough
+                break;
+            }
+        }
+    } else if (epsilon2 == 0.0) {
+        ;
+    } else {                            // we need to deconvolve the PSF model to match the object
+        /*
+         * We're going to deconvolve by using a linear expansion of the kernel 
+         *
+         * We start by convolving the PSF with a Gaussian, and expanding in a taylor series
+         *           PSF \otimes N(delta^2) = PSF + delta*d(PSF)/d(width) + ...
+         * so
+         *           d(PSF)/d(width) ~ (PSF \otimes N(delta^2) - PSF)/delta
+         *
+         * we can then get a deconvolved PSF by evaluating
+         *           PSF - |epsilon|*d(PSF)/d(width)
+         *
+         * Choosing delta's a black art;  we have a pixellated image so it can't be too small.
+         *
+         * In practice it works better to repeatedly subtract multiples of d(PSF)/d(width)
+         * until our image has the desired RMS
+         */
+        double const psfRmsCorrected = ::sqrt(psfRms*psfRms + epsilon2); // n.b. epsilon2 < 0
+
+        double delta = ctrl.deconvolutionKernelSigma; // smoothing length used to estimate deconvolution
+        afwMath::GaussianFunction1<double> gauss(delta);
+        int const kSize = 2*static_cast<int>(3*delta + 1) + 1;
+        afwMath::SeparableKernel const kernel(kSize, kSize, gauss, gauss);
+        {
+            afwDetection::Psf::Image kim(kSize, kSize);
+            kernel.computeImage(kim, true);
+            delta = calcRms(kim);       // the width allowing for pixellation
+        }
+
+        afwMath::convolve(smoothed, *psfImage, kernel, normalize, copyEdge); // PSF \otimes N
+        
+        smoothed -= *psfImage;          // delta*d(psfImage)/d(width)
+        smoothed /= delta;              // d(psfImage)/d(width)
+        //
+        // Iterate until we get the desired PSF width
+        //
+        {
+            double a = ::sqrt(-epsilon2); // we know that we need to deconvolve, so take the absolute value
+            for (int i = 0; i < ctrl.niter; ++i) {
+                smoothed *= a;        //  ~ a*d(psfImage)/d(width)
+                *psfImage -= smoothed;
+                smoothed /= a;        //  ~ d(psfImage)/d(width)
+                double const rms = calcRms(*psfImage);
+
+                a = rms/psfRmsCorrected - 1;                
+                
+                if (::fabs(a) < ctrl.rmsTol) { // good enough
+                    break;
+                }
+            }
+        }
+    }
+    //
+    // OK, we have the proper PSF so we can proceed to make the measurement
+    //
     std::pair<double,double> result = computeDeconvolvedPsfFlux(exposure.getMaskedImage(), psfImage, center);
     source.set(getKeys().meas, result.first);
     source.set(getKeys().err, result.second);
@@ -201,7 +335,6 @@ void DeconvolvedPsfFlux::_apply(
     std::pair<double,double> psfResult = computeDeconvolvedPsfFlux(*psfImage, psfImage, center);
     source.set(_fluxCorrectionKeys.psfFactor, psfResult.first);
     source.set(_fluxCorrectionKeys.psfFactorFlag, false);
-
 }
 
 LSST_MEAS_ALGORITHM_PRIVATE_IMPLEMENTATION(DeconvolvedPsfFlux);
