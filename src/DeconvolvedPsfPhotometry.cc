@@ -223,17 +223,19 @@ void DeconvolvedPsfFlux::_apply(
     // Allow for the variation of the PSF with intensity
     //
     if (source.getApFluxFlag()) {
+#if 1                                   // XXXXXXXXXXXXXXXXXXXXX
         throw LSST_EXCEPT(lsst::pex::exceptions::NotFoundException,
                           str(boost::format("Aperture flux is invalid for object at (%.3f, %.3f)")
                               % center.getX() % center.getY()));
+#endif
     }
 
-    double const apFlux = source.getApFlux(); // object's flux
-    double const flux0 = ctrl.flux0;          // fiducial flux (see coeff)
-    double const coeff = ctrl.coeff;    // intensity kernel is N(0, coeff*log10(flux/ctrl.flux0)^2)
-    double const psfFlux = ctrl.psfFlux;      // characteristic flux of the PSF
+    double const objFlux = source.getPsfFlux(); // object's flux
+    double const flux0 = ctrl.flux0;            // fiducial flux (see coeff)
+    double const coeff = ctrl.coeff;            // intensity kernel is N(0, coeff*log10(flux/ctrl.flux0)^2)
+    double const psfFlux = ctrl.psfFlux;        // characteristic flux of the PSF
     double const epsilon2 =
-        ::pow(coeff*::log10( apFlux/flux0), 2) - 
+        ::pow(coeff*::log10(objFlux/flux0), 2) - 
         ::pow(coeff*::log10(psfFlux/flux0), 2); // (correction we need to apply)^2
  
     double const psfRms = calcRms(*psfImage);
@@ -321,6 +323,9 @@ void DeconvolvedPsfFlux::_apply(
             }
         }
     }
+#if 0
+    psfImage = psf->computeImage(center); // debugging XXXXXXXXXXXXXXXXXXXXX
+#endif
     //
     // OK, we have the proper PSF so we can proceed to make the measurement
     //

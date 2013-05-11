@@ -125,7 +125,7 @@ class DeconvolvedPsfPhotometryTestCase(unittest.TestCase):
         msConfig.algorithms.names.remove("correctfluxes")
         msConfig.slots.apFlux = "flux.sinc"
 
-        msConfig.algorithms["flux.deconvolvedPsf"].priority = 4 # i.e. run after other flux algorithms
+        msConfig.algorithms["flux.deconvolvedPsf"].priority = 2.01 # i.e. run after other flux algorithms
         #msConfig.algorithms["flux.deconvolvedPsf"].deconvolutionKernelSigma = 0.4
         msConfig.algorithms["flux.deconvolvedPsf"].coeff = self.coeff
         msConfig.algorithms["flux.deconvolvedPsf"].psfFlux = self.psfFlux
@@ -175,7 +175,7 @@ class DeconvolvedPsfPhotometryTestCase(unittest.TestCase):
                     for objFlux in (1e2, 1e3, 1e4, 1e5, 1e6, ):
                         flux, fluxErr, flags, psfFlux = self.makeAndMeasure(objFlux, alpha, b, dx=dx, dy=dy)
                         
-                        failFlux =  math.isnan(flux) or flags or abs(flux/objFlux - 1) > 2.5e-3
+                        failFlux =  math.isnan(flux) or flags or abs(flux/objFlux - 1) > 0.3e-2
                         
                         ID = "alpha,b %4.1f, %5.2f  dx,dy = %.1f,%.1f " % (alpha, b, dx, dy)
                         msg = "%s  flux_DeconvolvedPsf: %9.4g v. exact value %9.4g (error %5.2f%%) (psfFlux error %5.2f%%)" % \
