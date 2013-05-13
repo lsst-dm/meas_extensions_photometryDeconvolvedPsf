@@ -9,6 +9,7 @@
 #include "lsst/afw/math/ConvolveImage.h"
 #include "lsst/afw/math/FunctionLibrary.h"
 #include "lsst/afw/math/Integrate.h"
+#include "lsst/afw/math/Statistics.h"
 #include "lsst/meas/algorithms/Measure.h"
 
 #include "lsst/afw/detection/Psf.h"
@@ -164,7 +165,7 @@ std::pair<double,double> computeDeconvolvedPsfFlux(
     double fluxErr = ::sqrt(wfluxFunctor.getSumVar())*::fabs(sum.sum)/sum.sum2;
     return std::make_pair(flux, fluxErr);
 }
-
+    
 /************************************************************************************************************/
 
 template<typename ImageT>
@@ -188,6 +189,135 @@ calcRms(ImageT const& img)
     sumrr /= sum;
 
     return ::sqrt(sumrr/2);
+}
+
+/************************************************************************************************************/
+
+PTR(afwMath::SeparableKernel)
+makeGaussianKernel0(double alpha)
+{
+    afwMath::GaussianFunction1<double> gauss(alpha);
+    int const kSize = 2*static_cast<int>(3*alpha + 1) + 1;
+    return boost::make_shared<afwMath::SeparableKernel>(kSize, kSize, gauss, gauss);
+}
+
+PTR(afwMath::SeparableKernel)
+makeGaussianKernel(double alpha, int const niter=10, double const tol=1e-4)
+{
+    if (niter <= 0) {
+        throw LSST_EXCEPT(lsst::pex::exceptions::InvalidParameterException,
+                          str(boost::format("niter must be >= 1; saw %d") % niter));
+    }
+
+    PTR(afwMath::SeparableKernel) kernel; // the desired kernel
+
+    double rms0 = alpha;                                        // desired rms
+    double epsilon_min = alpha, epsilon_max = ::hypot(alpha, 1); // range of possible values
+    double rms_min, rms_max;            // rms of kernel with epsilon = epsilon_{min,max}
+    rms_min = rms_max = std::numeric_limits<double>::quiet_NaN(); // unknown
+    double rms;                                                   // measured rms
+
+    for (int i = 0; i != niter; ++i) {
+        kernel = makeGaussianKernel0(alpha);
+        {
+            afwDetection::Psf::Image kim(kernel->getDimensions());
+            kernel->computeImage(kim, true);
+
+            rms = calcRms(kim);
+        }
+        //printf("%2d %.4f <= %.4f <= %.4f rms: %.4f\n", i, epsilon_min, alpha, epsilon_max, rms);
+
+        if (::fabs(rms - rms0) < tol) {
+            break;
+        } else if (rms > rms0) {
+            if (alpha <= epsilon_min) {
+                break;
+            }
+            if (!utils::isfinite(rms_max)) {
+                double tmp = alpha;
+                alpha = 0.5*(alpha + epsilon_min);
+                epsilon_max = tmp;
+            } else {
+                double nalpha = epsilon_max - (rms_max - rms0)*(epsilon_max - alpha)/(rms_max - rms);
+                if (nalpha < epsilon_min) {
+                    nalpha = 0.5*(alpha + epsilon_min);
+                }
+                epsilon_max = alpha;
+                alpha = nalpha;
+            }
+            rms_max = rms;
+        } else {
+            if (alpha == epsilon_max) {
+                break;
+            }
+            if (!utils::isfinite(rms_min)) {
+                double const tmp = alpha;
+                alpha = 0.5*(alpha + epsilon_max);
+                epsilon_min = tmp;
+            } else {
+                double nalpha = epsilon_min + (rms0 - rms_min)*(alpha - epsilon_min)/(rms - rms_min);
+                if (nalpha > epsilon_max) {
+                    nalpha = 0.5*(alpha + epsilon_max);
+                }
+                epsilon_min = alpha;
+                alpha = nalpha;
+            }
+            rms_min = rms;
+        }
+    }
+    //std::cout << "alpha = " << alpha << std::endl;
+
+    return kernel;
+}
+
+/************************************************************************************************************/
+/*
+ * Lucy-Richardson deconvolution of img with an N(0, epsilon^2) kernel
+ */
+template<typename ImageT>
+PTR(ImageT)
+deconvolveLR(ImageT const& phi_,        // image to deconvolve
+             double epsilon,            // with an N(0, epsilon^2) kernel
+             int niter=10)              // number of L-R iterations
+{
+    ImageT phi = phi_;                  // we need a writeable copy as we need to add a bias to make it > 0
+    afw::math::Statistics const stats =
+        afw::math::makeStatistics(phi, afw::math::MIN | afw::math::MAX | afw::math::MEAN);
+    double const min = ::fabs(stats.getValue(afw::math::MIN));
+    double const max = ::fabs(stats.getValue(afw::math::MAX));
+    double const bkgd = min + 1e-3*(max - min);
+    phi += bkgd;
+
+    PTR(afw::math::SeparableKernel const) kernel = makeGaussianKernel(epsilon); // N(0, epsilon^2)
+    /*
+     * The input data's phi; the deconvolved data's psi
+     */
+    PTR(ImageT) psi_r = boost::make_shared<ImageT>(phi.getDimensions()); // previous estimate of psi
+    PTR(ImageT) psi_rp1 = boost::make_shared<ImageT>(phi.getDimensions()); // current estimate of psi
+
+    ImageT phi_r(phi.getDimensions());  // current estimate of observed data (== psi otimes kernel)
+    ImageT tmp(phi.getDimensions());                                       // temp space
+    
+    *psi_r = stats.getValue(afw::math::MEAN); // initial estimate is mean of input data
+    for (int i = 0; i != niter; ++i) {
+        bool const normalize = true;
+        bool const copyEdge = true;
+        afwMath::convolve(phi_r, *psi_r, *kernel, normalize, copyEdge);
+
+        tmp = phi;
+        tmp /= phi_r;
+        afwMath::convolve(*psi_rp1, tmp, *kernel, normalize, copyEdge);
+        *psi_rp1 *= *psi_r;
+
+#if 0
+        psi_r.swap(psi_rp1);            // update
+#else
+        *psi_r = *psi_rp1;              // update
+#endif
+    }
+    *psi_r -= bkgd;
+
+    return psi_r;
 }
 
 /************************************************************************************************************/
@@ -222,12 +352,10 @@ void DeconvolvedPsfFlux::_apply(
     //
     // Allow for the variation of the PSF with intensity
     //
-    if (source.getApFluxFlag()) {
-#if 1                                   // XXXXXXXXXXXXXXXXXXXXX
+    if (source.getPsfFluxFlag()) {
         throw LSST_EXCEPT(lsst::pex::exceptions::NotFoundException,
                           str(boost::format("Aperture flux is invalid for object at (%.3f, %.3f)")
                               % center.getX() % center.getY()));
-#endif
     }
 
     double const objFlux = source.getPsfFlux(); // object's flux
@@ -238,94 +366,19 @@ void DeconvolvedPsfFlux::_apply(
         ::pow(coeff*::log10(objFlux/flux0), 2) - 
         ::pow(coeff*::log10(psfFlux/flux0), 2); // (correction we need to apply)^2
  
-    double const psfRms = calcRms(*psfImage);
-
     afwDetection::Psf::Image smoothed(psfImage->getDimensions());
-    bool const normalize = true;
-    bool const copyEdge = true;
     if (epsilon2 > 0) {                  // we need to smooth our PSF model to match the object
-        double const psfRmsCorrected = ::sqrt(psfRms*psfRms + epsilon2);
-        //
-        // Iterate until we get the desired PSF width
-        //
-        double a = ::sqrt(epsilon2);    // width of needed smoothing kernel
-        for (int i = 0; i < ctrl.niter; ++i) {
-            a = ::hypot(a, 0.25);       // Undersampled kernels are essentially delta-functions
-            afwMath::GaussianFunction1<double> gauss(a);
-            int const kSize = 2*static_cast<int>(3*a + 1) + 1;
-            afwMath::SeparableKernel const kernel(kSize, kSize, gauss, gauss);
-
-            afwMath::convolve(smoothed, *psfImage, kernel, normalize, copyEdge);
-            double const rms = calcRms(smoothed);
-            if (rms >= psfRmsCorrected) {
-                break;
-            }
-
-            *psfImage = smoothed;
-
-            a = ::sqrt(::pow(psfRmsCorrected, 2) - ::pow(rms, 2));
-            
-            if (::fabs(a) < ctrl.rmsTol) { // good enough
-                break;
-            }
-        }
+        PTR(afwMath::SeparableKernel const) kernel = makeGaussianKernel(::sqrt(epsilon2));
+        bool const normalize = true;
+        bool const copyEdge = true;
+        afwMath::convolve(smoothed, *psfImage, *kernel, normalize, copyEdge);
+        *psfImage = smoothed;
     } else if (epsilon2 == 0.0) {
         ;
     } else {                            // we need to deconvolve the PSF model to match the object
-        /*
-         * We're going to deconvolve by using a linear expansion of the kernel 
-         *
-         * We start by convolving the PSF with a Gaussian, and expanding in a taylor series
-         *           PSF \otimes N(delta^2) = PSF + delta*d(PSF)/d(width) + ...
-         * so
-         *           d(PSF)/d(width) ~ (PSF \otimes N(delta^2) - PSF)/delta
-         *
-         * we can then get a deconvolved PSF by evaluating
-         *           PSF - |epsilon|*d(PSF)/d(width)
-         *
-         * Choosing delta's a black art;  we have a pixellated image so it can't be too small.
-         *
-         * In practice it works better to repeatedly subtract multiples of d(PSF)/d(width)
-         * until our image has the desired RMS
-         */
-        double const psfRmsCorrected = ::sqrt(psfRms*psfRms + epsilon2); // n.b. epsilon2 < 0
-
-        double delta = ctrl.deconvolutionKernelSigma; // smoothing length used to estimate deconvolution
-        afwMath::GaussianFunction1<double> gauss(delta);
-        int const kSize = 2*static_cast<int>(3*delta + 1) + 1;
-        afwMath::SeparableKernel const kernel(kSize, kSize, gauss, gauss);
-        {
-            afwDetection::Psf::Image kim(kSize, kSize);
-            kernel.computeImage(kim, true);
-            delta = calcRms(kim);       // the width allowing for pixellation
-        }
-
-        afwMath::convolve(smoothed, *psfImage, kernel, normalize, copyEdge); // PSF \otimes N
-        
-        smoothed -= *psfImage;          // delta*d(psfImage)/d(width)
-        smoothed /= delta;              // d(psfImage)/d(width)
-        //
-        // Iterate until we get the desired PSF width
-        //
-        {
-            double a = ::sqrt(-epsilon2); // we know that we need to deconvolve, so take the absolute value
-            for (int i = 0; i < ctrl.niter; ++i) {
-                smoothed *= a;        //  ~ a*d(psfImage)/d(width)
-                *psfImage -= smoothed;
-                smoothed /= a;        //  ~ d(psfImage)/d(width)
-                double const rms = calcRms(*psfImage);
-
-                a = rms/psfRmsCorrected - 1;                
-                
-                if (::fabs(a) < ctrl.rmsTol) { // good enough
-                    break;
-                }
-            }
-        }
+        psfImage = deconvolveLR(*psfImage, ::sqrt(-epsilon2), ctrl.niter);
     }
-#if 0
-    psfImage = psf->computeImage(center); // debugging XXXXXXXXXXXXXXXXXXXXX
-#endif
+
     //
     // OK, we have the proper PSF so we can proceed to make the measurement
     //

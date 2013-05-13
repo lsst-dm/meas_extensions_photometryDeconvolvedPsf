@@ -175,7 +175,7 @@ class DeconvolvedPsfPhotometryTestCase(unittest.TestCase):
                     for objFlux in (1e2, 1e3, 1e4, 1e5, 1e6, ):
                         flux, fluxErr, flags, psfFlux = self.makeAndMeasure(objFlux, alpha, b, dx=dx, dy=dy)
                         
-                        failFlux =  math.isnan(flux) or flags or abs(flux/objFlux - 1) > 0.3e-2
+                        failFlux =  math.isnan(flux) or flags or abs(flux/objFlux - 1) > 0.25e-2
                         
                         ID = "alpha,b %4.1f, %5.2f  dx,dy = %.1f,%.1f " % (alpha, b, dx, dy)
                         msg = "%s  flux_DeconvolvedPsf: %9.4g v. exact value %9.4g (error %5.2f%%) (psfFlux error %5.2f%%)" % \
@@ -183,7 +183,7 @@ class DeconvolvedPsfPhotometryTestCase(unittest.TestCase):
 
                         if False:
                             print msg
-                            #continue
+                            continue
 
                         self.assertFalse(failFlux, msg)
 
